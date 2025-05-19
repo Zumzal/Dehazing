@@ -1,0 +1,84 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%% Compute Airlight Amplitude %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function A = estimateAirlightAmplitude(img, Ahat)
+% estimateAirlightAmplitude  Recover airlight magnitude a = ‖A‖
+% Inputs:
+%   img  - H×W×3 hazy RGB image (double in [0,1])
+%   Ahat - 1×3 unit‐vector orientation returned by airlightEstimation(img)
+% Output:
+%   A    - 1×3 full atmospheric‐light vector = a_est * Ahat
+
+  %--- Step 1: Dehaze assuming a = 1 -----------------------------------
+  % (follows Stage 2 paper text: “dehaze with Â to get J and t” 
+  [J, t] = dehaze(img, Ahat);  
+  % J(x) is the 1×3 recovered haze-free radiance at each pixel
+  % t(x) is the transmission map
+
+  %--- Step 2: Compute per-pixel brightness lₐ(x) (Eq. 6) -------------
+  %   lₐ(x) = ∥J(x)∥₂, and for a=1 this equals the true l(x)
+  l = sqrt( sum( J.^2, 3 ) );            
+
+  %--- Step 3: Build lₐ* curve (Eq. 8) ---------------------------------
+  numBins = 100;
+  sVals   = linspace(0,1,numBins+1);    % transmission bins
+  Lstar   = nan(1, numBins);
+  halfBin = 1/numBins/2;
+  for b = 1:numBins
+    mask = abs( t - sVals(b+1) ) < halfBin;
+    if any(mask(:))
+      Lstar(b) = prctile( l(mask), 99 );
+    end
+  end
+
+  %--- Step 4: Define cost(a,k) implementing Eqs. 9–10 ----------------
+  costFun = @(ak) amplitudeCost(ak, sVals(2:end), Lstar);
+
+  %--- Step 5: Solve for [a_est, k_est] via fminsearch (Eq. 10) -------
+  init  = [1,1];                     
+  params = fminsearch(costFun, init);
+  a_est  = params(1);
+
+  %--- Step 6: Enforce valid domain for sₐ = (s-1)/a + 1 ------------
+  s = sVals(2:end);
+  while any( (s-1)/a_est + 1 < 0 )
+    Ahat = 1.2 * Ahat;               % bump orientation magnitude
+    [J, t] = dehaze(img, Ahat);
+    l = sqrt( sum(J.^2,3) );
+    for b = 1:numBins
+      mask = abs(t - sVals(b+1)) < halfBin;
+      if any(mask(:))
+        Lstar(b) = prctile( l(mask), 99 );
+      end
+    end
+    costFun = @(ak) amplitudeCost(ak, s, Lstar);
+    params   = fminsearch(costFun, params);
+    a_est    = params(1);
+  end
+
+  %--- Step 7: Form final atmospheric-light vector --------------------
+  % Return as 1×3 row, matching airlightEstimation’s output format
+  A = a_est * Ahat;
+end
+
+
+function cost = amplitudeCost(ak, s, Lstar)
+% amplitudeCost  Compute objective from Eqs. 9–10
+%   ak    - [a; k]
+%   s     - 1×B transmission bins
+%   Lstar - 1×B values of lₐ* at those bins
+
+  a = ak(1);   % candidate amplitude
+  k = ak(2);   % approx. constant true brightness
+
+  % Eq. 9: warp bins → sₐ = (s-1)/a + 1
+  sa = (s - 1)/a + 1;
+
+  % interpolate Lstar at warped points
+  Li = interp1(s, Lstar, sa, 'pchip', NaN);
+
+  % Eq. 6: σₐ(s) = a·s / (s + a - 1)
+  sigma = a .* s ./ (s + a - 1);
+
+  % Eq. 10: sum of squared errors
+  cost = nansum( (Li - sigma*k).^2 );
+end
